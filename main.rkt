@@ -57,8 +57,7 @@
                                     (ptr-ref pprocess _PROCESSENTRY32W))))
                                  (PROCESSENTRY32W-th32ProcessID
                                   (ptr-ref pprocess _PROCESSENTRY32W)))
-                                now-list))
-          )
+                                now-list)))
         now-list))
 
   (define (get-all-process-name-and-id)
@@ -70,7 +69,8 @@
          [snapshot (CreateToolhelp32Snapshot 2 0)])
       (begin0
           (if (Process32FirstW snapshot pprocess)
-              (iterate-all-process pprocess snapshot
+              (iterate-all-process pprocess
+                                   snapshot
                                    (list (cons
                                           (bytes/utf-16->string
                                            (list->bytes
