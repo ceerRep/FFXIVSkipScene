@@ -3,7 +3,9 @@
 (module ffi-part racket
   (provide get-all-process-name-and-id
            get-process-by-name
-           write-process-memory)
+           write-process-memory
+           get-module-base-by-image-name
+           bytes/utf-16->string)
   (require ffi/unsafe
            ffi/unsafe/define
            ffi/winapi)
@@ -12,10 +14,12 @@
     (_fun #:abi winapi type ...))
 
   (define-ffi-definer define-kernel32 (ffi-lib "kernel32.dll"))
+  (define-ffi-definer define-psapi (ffi-lib "psapi.dll"))
 
-  (define _HANDLE (_cpointer/null 'OBJECT))
+  (define _HANDLE _uintptr) ;(_cpointer/null 'OBJECT))
 
   (define MAX_PATH 260)
+  (define MAX_MODULE 128)
 
   (define-cstruct
     _PROCESSENTRY32W
@@ -30,6 +34,12 @@
      [dwFlags               _uint32]
      [szExeFile             (_array/list _uint8 (* 2 MAX_PATH))]))
 
+  (define-cstruct
+    _MODULEINFO
+    ([lpBaseOfDll           _uintptr]
+     [SizeOfImage           _uint32]
+     [EntryPoint            _uintptr]))
+
 
   (define-kernel32 CreateToolhelp32Snapshot (_wfun _uint32 _uint32 -> _HANDLE))
   (define-kernel32 Process32FirstW (_wfun _HANDLE _PROCESSENTRY32W-pointer/null -> _bool))
@@ -38,6 +48,27 @@
   (define-kernel32 OpenProcess     (_wfun _uint32 _bool _uint32 -> _HANDLE))
   (define-kernel32 WriteProcessMemory
     (_wfun _HANDLE _uintptr _pointer _uintptr _uintptr -> _bool))
+  (define-psapi    EnumProcessModules   (_wfun _HANDLE
+                                               (modules : (_list o _HANDLE MAX_MODULE))
+                                               (_int32 = (* MAX_MODULE (ctype-sizeof _HANDLE)))
+                                               (need : (_ptr o _int32))
+                                               -> (ret : _bool)
+                                               -> (values modules need ret)))
+  (define-psapi    GetModuleFileNameExW (_wfun _HANDLE
+                                               _HANDLE
+                                               (filename : (_bytes/nul-terminated
+                                                            o
+                                                            (* 2 MAX_PATH)))
+                                               (_int32 = MAX_PATH)
+                                               -> (ret : _int32)
+                                               -> (values filename ret)))
+  (define-psapi   GetModuleInformation  (_wfun _HANDLE
+                                               _HANDLE
+                                               (modinfo : (_ptr o _MODULEINFO))
+                                               (_int32 = (ctype-sizeof _MODULEINFO))
+                                               -> (ret : _bool)
+                                               -> (values modinfo ret)))
+  
 
   (define (bytes/utf-16->string input)
     (let ([convert (bytes-open-converter "platform-UTF-16" "platform-UTF-8")])
@@ -48,16 +79,17 @@
   (define (iterate-all-process pprocess handle now-list)
     (if (Process32NextW handle pprocess)
         (begin
-          (iterate-all-process pprocess handle
-                               (cons
-                                (cons
-                                 (bytes/utf-16->string
-                                  (list->bytes
-                                   (PROCESSENTRY32W-szExeFile
-                                    (ptr-ref pprocess _PROCESSENTRY32W))))
-                                 (PROCESSENTRY32W-th32ProcessID
-                                  (ptr-ref pprocess _PROCESSENTRY32W)))
-                                now-list)))
+          (iterate-all-process
+           pprocess handle
+           (cons
+            (cons
+             (bytes/utf-16->string
+              (list->bytes
+               (PROCESSENTRY32W-szExeFile
+                (ptr-ref pprocess _PROCESSENTRY32W))))
+             (PROCESSENTRY32W-th32ProcessID
+              (ptr-ref pprocess _PROCESSENTRY32W)))
+            now-list)))
         now-list))
 
   (define (get-all-process-name-and-id)
@@ -69,21 +101,47 @@
          [snapshot (CreateToolhelp32Snapshot 2 0)])
       (begin0
           (if (Process32FirstW snapshot pprocess)
-              (iterate-all-process pprocess
-                                   snapshot
-                                   (list (cons
-                                          (bytes/utf-16->string
-                                           (list->bytes
-                                            (PROCESSENTRY32W-szExeFile
-                                             (ptr-ref pprocess _PROCESSENTRY32W))))
-                                          (PROCESSENTRY32W-th32ProcessID
-                                           (ptr-ref pprocess _PROCESSENTRY32W)))))
+              (iterate-all-process
+               pprocess
+               snapshot
+               (list (cons
+                      (bytes/utf-16->string
+                       (list->bytes
+                        (PROCESSENTRY32W-szExeFile
+                         (ptr-ref pprocess _PROCESSENTRY32W))))
+                      (PROCESSENTRY32W-th32ProcessID
+                       (ptr-ref pprocess _PROCESSENTRY32W)))))
               empty)
         (CloseHandle snapshot))))
 
   (define (get-process-by-name name)
     (for/or ([n-i (get-all-process-name-and-id)])
       (if (equal? name (car n-i)) (cdr n-i) #f)))
+
+  (define (get-module-base-by-image-name pid image)
+    ; #x0038: PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_VM_CONTROL
+    (let*-values
+        ([(process-handle) (OpenProcess #x0038 #f pid)]
+         [(module-handles nd ret) (EnumProcessModules process-handle)]
+         [(target-module)
+          (for/or ([module-handle module-handles])
+            (let*-values
+                ([(name-bytes ret) (GetModuleFileNameExW process-handle module-handle)]
+                 [(name-string) (bytes/utf-16->string name-bytes)])
+              (if (and
+                   (>= (string-length name-string) (string-length image))
+                   (equal? "ffxiv_dx11.exe"
+                           (substring name-string
+                                      (- (string-length name-string)
+                                         (string-length image)))))
+                  module-handle
+                  #f)))])
+      (begin0
+          (if target-module
+              (let-values ([(modinfo ret) (GetModuleInformation process-handle target-module)])
+                (MODULEINFO-lpBaseOfDll modinfo))
+              #f)
+        (CloseHandle process-handle))))
 
   (define (write-process-memory pid address content)
     ; #x0038: PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_VM_CONTROL
@@ -110,21 +168,24 @@
 
   (define (patch)
     ;; by @Bluefissure
-    ;; #x7FF748AF0000: Base address of ffxiv_dx11.exe; may change
-    (and (write-process-memory (or (get-process-by-name "ffxiv_dx11.exe") 0)
-                               (+ #x7FF748AF0000 #x8450ed)
-                               '(#x90 #x90))
-         (write-process-memory (or (get-process-by-name "ffxiv_dx11.exe") 0)
-                               (+ #x7FF748AF0000 #x845108)
-                               '(#x90 #x90))))
+    (let* ([pid  (or (get-process-by-name "ffxiv_dx11.exe") 0)]
+           [base (get-module-base-by-image-name pid "ffxiv_dx11.exe")])
+      (and (write-process-memory pid
+                                 (+ base #x8450ed)
+                                 '(#x90 #x90))
+           (write-process-memory (or (get-process-by-name "ffxiv_dx11.exe") 0)
+                                 (+ base #x845108)
+                                 '(#x90 #x90)))))
 
   (define (recover)
-    (and (write-process-memory (or (get-process-by-name "ffxiv_dx11.exe") 0)
-                               (+ #x7FF748AF0000 #x8450ed)
-                               '(#x75 #x33))
-         (write-process-memory (or (get-process-by-name "ffxiv_dx11.exe") 0)
-                               (+ #x7FF748AF0000 #x845108)
-                               '(#x74 #x18))))
+    (let* ([pid  (or (get-process-by-name "ffxiv_dx11.exe") 0)]
+           [base (get-module-base-by-image-name pid "ffxiv_dx11.exe")])
+      (and (write-process-memory (or pid 0)
+                                 (+ base #x8450ed)
+                                 '(#x75 #x33))
+           (write-process-memory (or pid 0)
+                                 (+ base #x845108)
+                                 '(#x74 #x18)))))
   
   (define (main)
 
@@ -154,6 +215,7 @@
 
     (send frame show #t)))
 
+(require 'ffi-part)
 (require 'gui-part)
 
 (main)
