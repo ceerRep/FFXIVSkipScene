@@ -47,7 +47,7 @@
   (define-kernel32 CloseHandle     (_wfun _HANDLE -> _bool))
   (define-kernel32 OpenProcess     (_wfun _uint32 _bool _uint32 -> _HANDLE))
   (define-kernel32 WriteProcessMemory
-    (_wfun _HANDLE _uintptr _pointer _uintptr _uintptr -> _bool))
+    (_wfun _HANDLE _uintptr _pointer _uintptr (_cpointer/null _uint32) -> _bool))
   (define-psapi    EnumProcessModules   (_wfun _HANDLE
                                                (modules : (_list o _HANDLE MAX_MODULE))
                                                (_int32 = (* MAX_MODULE (ctype-sizeof _HANDLE)))
@@ -130,7 +130,7 @@
                  [(name-string) (bytes/utf-16->string name-bytes)])
               (if (and
                    (>= (string-length name-string) (string-length image))
-                   (equal? "ffxiv_dx11.exe"
+                   (equal? image
                            (substring name-string
                                       (- (string-length name-string)
                                          (string-length image)))))
@@ -140,7 +140,7 @@
           (if target-module
               (let-values ([(modinfo ret) (GetModuleInformation process-handle target-module)])
                 (MODULEINFO-lpBaseOfDll modinfo))
-              #f)
+              0)
         (CloseHandle process-handle))))
 
   (define (write-process-memory pid address content)
@@ -157,7 +157,7 @@
                                   address
                                   memptr
                                   len
-                                  0)
+                                  #f)
             (CloseHandle process-handle))
           #f))))
 
@@ -173,26 +173,21 @@
       (and (write-process-memory pid
                                  (+ base #x8450ed)
                                  '(#x90 #x90))
-           (write-process-memory (or (get-process-by-name "ffxiv_dx11.exe") 0)
+           (write-process-memory pid
                                  (+ base #x845108)
                                  '(#x90 #x90)))))
 
   (define (recover)
     (let* ([pid  (or (get-process-by-name "ffxiv_dx11.exe") 0)]
            [base (get-module-base-by-image-name pid "ffxiv_dx11.exe")])
-      (and (write-process-memory (or pid 0)
+      (and (write-process-memory pid
                                  (+ base #x8450ed)
                                  '(#x75 #x33))
-           (write-process-memory (or pid 0)
+           (write-process-memory pid
                                  (+ base #x845108)
                                  '(#x74 #x18)))))
   
   (define (main)
-
-    (define test-frame%
-      (class frame%
-        (define/override (on-subwindow-char r ke) (#f))
-        (super-new)))
     
     (define frame (instantiate dialog% ("QAQ")))
     (define msg (new message%
